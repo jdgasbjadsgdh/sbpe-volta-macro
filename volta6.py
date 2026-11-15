@@ -16,6 +16,9 @@ import util
 # With direct_swap the inventory is never opened: the plugin sends the same
 # 'move item' command the inventory screen sends when you equip the item in
 # its first slot, so movement is not interrupted.
+#
+# With eight_shots and a second Volta in that slot, each reset is one move
+# that equips the other Volta, which leaves enough input buffer for 8 shots.
 
 SDL_KEYDOWN = 0x300
 SDL_KEYUP = 0x301
@@ -31,6 +34,15 @@ MODIFY_INV_CTOR_SIG = bytes.fromhex('55c701')  # followed by the vtable address
 MODINV_MOVE = 2
 # queue wait meaning "in the same frame as the previous event"
 SAME_FRAME = -1
+
+# input buffer spent by every shoot press and every inventory move. the
+# buffer holds 1000 and refills by 1 every millisecond
+INPUT_COST = 75
+# eight_shots mode
+EIGHT = 8
+# items to look through for a slot, the bag can hold more than the 64
+# equipped-item lookup in gun() expects
+MAX_ITEMS = 512
 
 # give up waiting for the real shot to leave its gun / for the fresh guns to
 # show up after this long, in seconds
@@ -131,6 +143,15 @@ class Plugin(PluginBase):
         self.config.option('min_buffer', 920, 'int')
         # delay between the swap and the next shot
         self.config.option('swap_delay', 0.01, 'float')
+        # fire 8 shots instead of `shots`. needs a second Volta (ideally an
+        # identical one) in swap_slot, plus direct_swap and sacrifice. every
+        # cooldown reset then equips the other Volta with ONE inventory move
+        # instead of swapping away and back with two, which is what leaves
+        # enough input buffer for 8. without a second Volta it fires `shots`
+        self.config.option('eight_shots', False, 'bool')
+        # input buffer kept spare during an 8-shot burst, so a movement key
+        # pressed mid-burst can't make the game drop one of the macro's inputs
+        self.config.option('buffer_reserve', 75, 'int')
 
         self.queue = []  # (wait since previous event, action, scancode)
         self.due = 0
@@ -138,6 +159,10 @@ class Plugin(PluginBase):
         self.realId = 0
         self.wasDown = False
         self.direct = None  # (thunk, vtable) once set up, False if unusable
+        self.single = False  # this burst resets with one move (eight_shots)
+        self.seen = set()  # real shots of this burst seen in flight
+        self.shootKey = 0
+        self.fired = 0  # real shots fired this burst
 
     def readMem(self, addr, size):
         buf = sdlffi.new('uint8_t[]', size)
@@ -211,13 +236,29 @@ class Plugin(PluginBase):
         if direct and not 0 <= cfg.swap_slot < 0x100:
             logging.error('swap_slot out of range')
             return
+        self.single = False
+        self.seen = set()
+        self.shootKey = shoot
+        self.fired = 0
+        if cfg.eight_shots and not (direct and cfg.sacrifice):
+            logging.error('eight_shots needs direct_swap and sacrifice, '
+                          'firing the normal burst')
         if direct and cfg.sacrifice:
             # the sequence uses nearly the whole input buffer, starting on a
             # part-filled one drops inputs half way through
             cw = self.refs.ClientWorld
             if cw != ffi.NULL and cw.inputBuffer < cfg.min_buffer:
                 return
-            self.queue = self.sacrificeQueue(shoot)
+            shots = cfg.shots
+            if cfg.eight_shots:
+                if self.spareVolta():
+                    shots = EIGHT
+                    self.single = True
+                else:
+                    logging.error(
+                        'eight_shots: inventory slot {} does not hold a second '
+                        'Volta, firing {} shots'.format(cfg.swap_slot + 1, shots))
+            self.queue = self.sacrificeQueue(shoot, shots)
             self.due = 0
             return
         q = []
@@ -274,7 +315,7 @@ class Plugin(PluginBase):
         self.queue = q
         self.due = 0
 
-    def sacrificeQueue(self, shoot):
+    def sacrificeQueue(self, shoot, shots):
         '''
         How the volta (HoverGun) works in the client:
         - it has two guns, each can fire once, a swap gives two fresh guns
@@ -288,10 +329,17 @@ class Plugin(PluginBase):
         is: press (the real shot), press again (the decoy), wait for the
         real shot to leave its gun, swap. The last pair is not followed by
         a swap, so both of its shots are real.
+
+        In eight_shots mode each swap is one inventory move to the other
+        Volta, so a cycle costs 225 input buffer instead of 300. Before each
+        real shot the plugin waits until the buffer holds the whole cycle,
+        and if an earlier real shot has already landed it stops swapping
+        (a swap would erase that shot's damage) and keeps the decoy as the
+        last real shot instead. see beforeUpdate
         '''
         cfg = self.config
         q = []
-        for i in range(max(cfg.shots - 2, 0)):
+        for i in range(max(shots - 2, 0)):
             # real shot. after a swap, downR waits for the fresh guns to
             # have been updated once, before that they do not aim up/down
             q.append((0, 'downR' if i > 0 else 'downA', shoot))
@@ -309,8 +357,8 @@ class Plugin(PluginBase):
         q.append((max(cfg.last_hold, 0), 'up', shoot))
         return q
 
-    def gun(self):
-        '''the equipped primary if it is a HoverGun.
+    def item(self, slot):
+        '''the item in a slot, None if empty.
         PlayerCharacter.items: unordered_map<int, Item*>,
         node = [next, key, Item*]'''
         cw = self.refs.ClientWorld
@@ -320,15 +368,53 @@ class Plugin(PluginBase):
         ht = pc.items.t
         node = ffi.cast('void **', ht.before_begin)
         n = 0
-        while node != ffi.NULL and n < min(ht.element_count, 64):
+        while node != ffi.NULL and n < min(ht.element_count, MAX_ITEMS):
             key = int(ffi.cast('uintptr_t', node[1])) & 0xffff
-            if key == SLOT_MAIN and node[2] != ffi.NULL:
-                if util.getClassName(node[2]) != 'HoverGun':
-                    return None
-                return ffi.cast('struct HoverGun *', node[2])
+            if key == slot and node[2] != ffi.NULL:
+                return node[2]
             node = ffi.cast('void **', node[0])
             n += 1
         return None
+
+    def gun(self):
+        '''the equipped primary if it is a HoverGun'''
+        it = self.item(SLOT_MAIN)
+        if it is None or util.getClassName(it) != 'HoverGun':
+            return None
+        return ffi.cast('struct HoverGun *', it)
+
+    def spareVolta(self):
+        '''is the equipped primary a Volta, with another one in swap_slot?'''
+        if self.gun() is None:
+            return False
+        spare = self.item(SLOT_INV + self.config.swap_slot)
+        return spare is not None and util.getClassName(spare) == 'HoverGun'
+
+    def landed(self):
+        '''has a real shot of this burst landed? it was seen flying and its
+        seed is gone, so its damage orbs exist and a swap would erase them'''
+        if not self.seen:
+            return False
+        objs = self.myObjects()
+        return any(i not in objs for i in self.seen)
+
+    def bufferReady(self):
+        '''eight_shots: is there input buffer for the whole cycle that this
+        real shot starts (real + decoy, plus the swap if one follows)?'''
+        cw = self.refs.ClientWorld
+        if cw == ffi.NULL:
+            return True
+        swaps = any(a == 'swapA' for _, a, _ in self.queue)
+        need = INPUT_COST * (3 if swaps else 2) + max(self.config.buffer_reserve, 0)
+        return cw.inputBuffer >= need
+
+    def finishPair(self):
+        '''eight_shots: a real shot landed before this pair's swap. skip the
+        swap and the rest of the burst, the decoy that is already flying
+        becomes the last real shot and is held like one'''
+        self.queue = [(max(self.config.last_hold, 0), 'up', self.shootKey)]
+        logging.info('eight_shots: a shot landed, finishing after {} shots '
+                     'so its damage is kept'.format(self.fired + 1))
 
     def myObjects(self):
         cw = self.refs.ClientWorld
@@ -339,9 +425,10 @@ class Plugin(PluginBase):
 
     def seedOut(self, now):
         '''has the real shot of this cycle left its gun?'''
-        if now >= self.anchor + SEED_TIMEOUT:
+        if self.realId in self.myObjects():
+            self.seen.add(self.realId)
             return True
-        return self.realId in self.myObjects()
+        return now >= self.anchor + SEED_TIMEOUT
 
     def gunsReady(self, now):
         '''have the guns made by the swap been updated yet?'''
@@ -390,7 +477,17 @@ class Plugin(PluginBase):
                 break
             if action == 'swapA' and not self.seedOut(now):
                 break
+            if action == 'swapA' and self.single and self.landed():
+                self.finishPair()
+                continue
             if action == 'downR' and not self.gunsReady(now):
+                break
+            if self.single and action in ('downA', 'downR') \
+                    and not self.bufferReady():
+                break
+            if self.single and action == 'swapA' and \
+                    self.refs.ClientWorld != ffi.NULL and \
+                    self.refs.ClientWorld.inputBuffer < INPUT_COST:
                 break
             _, action, sc = self.queue.pop(0)
             if action == 'mark':
@@ -401,6 +498,7 @@ class Plugin(PluginBase):
                 continue
             if action in ('downA', 'downR'):
                 self.anchor = now
+                self.fired += 1
                 action = 'down'
             elif action == 'swapA':
                 action = 'swap'
@@ -408,8 +506,11 @@ class Plugin(PluginBase):
                 self.rehold()
                 continue
             if action == 'swap':
+                # eight_shots: one move equips the other Volta, otherwise
+                # swap to the other primary and back
                 self.swap()
-                self.swap()
+                if not self.single:
+                    self.swap()
             elif action == 'tap':
                 self.push(sc, True)
                 self.push(sc, False)

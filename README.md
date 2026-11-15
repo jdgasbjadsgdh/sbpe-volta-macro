@@ -56,6 +56,45 @@ sequence uses almost the whole input buffer, so the trigger is ignored when the
 buffer is below `min_buffer`. Starting on a part-filled buffer would drop
 inputs halfway through.
 
+## 8 shots (`eight_shots = yes`)
+
+Six shots is the most the normal burst can fit. The limit is the client's
+**input buffer**:
+- It holds at most 1000 and refills by 1 every millisecond.
+- Every shoot press and every inventory move costs 75.
+- A normal cycle costs 300: the real shot, the decoy, and two moves (swap
+  away, swap back). Six shots spend about 1350 over roughly half a second,
+  which nearly empties a full buffer.
+- Setting `shots = 8` on its own runs the buffer dry. The game then drops
+  presses partway through, and you still end up with about 6 shots.
+
+`eight_shots = yes` gets around this with **a second Volta**:
+- Equip one Volta and put the other in inventory slot `swap_slot` (the
+  first slot by default).
+- Each cooldown reset then takes **one** inventory move that equips the other
+  Volta, since a freshly equipped Volta has fresh guns. A cycle costs 225
+  instead of 300, which leaves room for 8 shots.
+- Before each real shot, the plugin waits until the buffer can pay for that
+  whole cycle plus `buffer_reserve`, so a movement key pressed mid-burst can't
+  make the game drop one of the macro's inputs.
+- Every equip erases damage orbs that already exist, and an 8-shot burst lasts
+  long enough for the first shot to land on a nearby wall or enemy before the
+  last swap. So before each swap the plugin checks whether an earlier real
+  shot has landed. If one has, it stops swapping and keeps the decoy that is
+  already flying as the last real shot. Up close you get fewer than 8, but
+  none of the damage is erased.
+- If slot `swap_slot` doesn't hold a Volta, the plugin logs that and fires the
+  normal `shots` burst.
+
+Use an identical Volta (same stats) so all 8 shots match. The plugin only
+checks that the item is a Volta, not that its stats match.
+
+```ini
+[plugin_volta6]
+enabled = yes
+eight_shots = yes
+```
+
 ## Install
 
 1. Put `volta6.py` in the `plugins` folder of your SBPE install. That's the
@@ -87,9 +126,11 @@ Times are in seconds.
 | `key_inventory` | `Tab` | Inventory key (key-press swap mode only). |
 | `key_swap` | `A` | Key that equips the selected inventory item (key-press swap mode only). |
 | `shots` | `6` | Total shots per trigger. With `sacrifice`, this counts shots that land. |
+| `eight_shots` | `no` | Fire 8 using a second Volta in `swap_slot` (see [8 shots](#8-shots-eight_shots--yes)). Needs `direct_swap` and `sacrifice`. |
+| `buffer_reserve` | `75` | Input buffer kept spare during an 8-shot burst, for movement. |
 | `shots_per_swap` | `2` | Shots between swaps. The Volta allows 2. |
 | `direct_swap` | `yes` | Swap through the client's inventory call instead of key presses. |
-| `swap_slot` | `0` | Inventory slot holding your other primary. 0 is the first slot. |
+| `swap_slot` | `0` | Inventory slot holding your other primary (your second Volta with `eight_shots`). 0 is the first slot. |
 | `sacrifice` | `yes` | Fire a decoy in each pair so the real shot survives the swap. |
 | `cycle_time` / `first_cycle_time` | `0.05` | Minimum time from a real shot's press to the swap. |
 | `min_buffer` | `920` | Ignore the trigger while the input buffer is below this. |
@@ -115,6 +156,9 @@ Times are in seconds.
 - The trigger is ignored while you type in chat (`SDL_IsTextInputActive`).
 - If the plugin is reloaded in the middle of a burst, it releases any key it
   was still holding.
+- `eight_shots` has been checked against an offline model of the rules above
+  (8 shots landed, no inputs dropped, nothing erased), but not yet in the
+  real game.
 
 ## Fair use
 
